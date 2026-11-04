@@ -81,62 +81,83 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            set -Eeuo pipefail
+            set -uo pipefail
 
             cd /home/ubuntu/lms-deployment
 
             test -f docker-compose.prod.yml
             test -f .env
 
-            export IMAGE_TAG="${{ github.sha }}"
-
+            NEW_TAG="${{ github.sha }}"
             PREVIOUS_TAG=""
+
             if [ -f .last_successful_image_tag ]; then
               PREVIOUS_TAG=$(cat .last_successful_image_tag)
             fi
 
-            echo "Deploying image: $IMAGE_TAG"
+            echo "New image: $NEW_TAG"
+            echo "Previous successful image: $PREVIOUS_TAG"
 
-            docker compose -f docker-compose.prod.yml pull
+            wait_for_health() {
+              for i in $(seq 1 30); do
+                BACKEND_STATUS=$(docker inspect \
+                  --format='{{.State.Health.Status}}' \
+                  lms-backend 2>/dev/null || echo missing)
 
-            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+                FRONTEND_STATUS=$(docker inspect \
+                  --format='{{.State.Health.Status}}' \
+                  lms-frontend 2>/dev/null || echo missing)
+
+                if [ "$BACKEND_STATUS" = "healthy" ] && \
+                   [ "$FRONTEND_STATUS" = "healthy" ] && \
+                   curl --fail --silent \
+                   http://localhost/api/health >/dev/null; then
+                  return 0
+                fi
+
+                echo "Waiting: backend=$BACKEND_STATUS frontend=$FRONTEND_STATUS"
+                sleep 5
+              done
+
+              return 1
+            }
 
             DEPLOY_OK=false
 
-            for i in $(seq 1 30); do
-              BACKEND_STATUS=$(docker inspect \
-                --format='{{.State.Health.Status}}' lms-backend 2>/dev/null || echo missing)
+            if IMAGE_TAG="$NEW_TAG" docker compose \
+              --env-file .env -f docker-compose.prod.yml pull &&
+               IMAGE_TAG="$NEW_TAG" docker compose \
+              --env-file .env -f docker-compose.prod.yml up -d --remove-orphans; then
 
-              FRONTEND_STATUS=$(docker inspect \
-                --format='{{.State.Health.Status}}' lms-frontend 2>/dev/null || echo missing)
-
-              if [ "$BACKEND_STATUS" = "healthy" ] && \
-                 [ "$FRONTEND_STATUS" = "healthy" ] && \
-                 curl --fail --silent http://localhost/api/health >/dev/null; then
+              if wait_for_health; then
                 DEPLOY_OK=true
-                break
               fi
-
-              echo "Waiting for application health: backend=$BACKEND_STATUS frontend=$FRONTEND_STATUS"
-              sleep 5
-            done
+            fi
 
             if [ "$DEPLOY_OK" = true ]; then
-              echo "$IMAGE_TAG" > .last_successful_image_tag
-              echo "Deployment successful: $IMAGE_TAG"
-            else
-              echo "Deployment failed. Starting rollback."
+              echo "$NEW_TAG" > .last_successful_image_tag
+              echo "Deployment successful: $NEW_TAG"
+              exit 0
+            fi
 
-              if [ -n "$PREVIOUS_TAG" ]; then
-                export IMAGE_TAG="$PREVIOUS_TAG"
+            echo "Deployment failed. Starting rollback."
 
-                docker compose -f docker-compose.prod.yml pull
-                docker compose -f docker-compose.prod.yml up -d
-
-                echo "Rollback attempted to image: $PREVIOUS_TAG"
-              else
-                echo "No previous successful image tag is available."
-              fi
-
+            if [ -z "$PREVIOUS_TAG" ]; then
+              echo "ERROR: No previous successful image tag available."
               exit 1
             fi
+
+            if IMAGE_TAG="$PREVIOUS_TAG" docker compose \
+              --env-file .env -f docker-compose.prod.yml pull &&
+               IMAGE_TAG="$PREVIOUS_TAG" docker compose \
+              --env-file .env -f docker-compose.prod.yml up -d; then
+
+              if wait_for_health; then
+                echo "$PREVIOUS_TAG" > .last_successful_image_tag
+                echo "Rollback successful: $PREVIOUS_TAG"
+                exit 1
+              fi
+            fi
+
+            echo "CRITICAL: Rollback could not be verified."
+            exit 1
