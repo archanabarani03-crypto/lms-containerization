@@ -1,0 +1,142 @@
+
+name: LMS CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lms-production-deployment
+  cancel-in-progress: false
+
+jobs:
+
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install and Build Frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install and Test Backend
+        working-directory: backend
+        run: |
+          npm ci
+          npm test
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Frontend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/lms-frontend:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/lms-frontend:latest
+
+      - name: Build and Push Backend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/lms-backend:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/lms-backend:latest
+
+  deploy:
+    name: Deploy to EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy Application to EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -Eeuo pipefail
+
+            cd /home/ubuntu/lms-deployment
+
+            test -f docker-compose.prod.yml
+            test -f .env
+
+            export IMAGE_TAG="${{ github.sha }}"
+
+            PREVIOUS_TAG=""
+            if [ -f .last_successful_image_tag ]; then
+              PREVIOUS_TAG=$(cat .last_successful_image_tag)
+            fi
+
+            echo "Deploying image: $IMAGE_TAG"
+
+            docker compose -f docker-compose.prod.yml pull
+
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+            DEPLOY_OK=false
+
+            for i in $(seq 1 30); do
+              BACKEND_STATUS=$(docker inspect \
+                --format='{{.State.Health.Status}}' lms-backend 2>/dev/null || echo missing)
+
+              FRONTEND_STATUS=$(docker inspect \
+                --format='{{.State.Health.Status}}' lms-frontend 2>/dev/null || echo missing)
+
+              if [ "$BACKEND_STATUS" = "healthy" ] && \
+                 [ "$FRONTEND_STATUS" = "healthy" ] && \
+                 curl --fail --silent http://localhost/api/health >/dev/null; then
+                DEPLOY_OK=true
+                break
+              fi
+
+              echo "Waiting for application health: backend=$BACKEND_STATUS frontend=$FRONTEND_STATUS"
+              sleep 5
+            done
+
+            if [ "$DEPLOY_OK" = true ]; then
+              echo "$IMAGE_TAG" > .last_successful_image_tag
+              echo "Deployment successful: $IMAGE_TAG"
+            else
+              echo "Deployment failed. Starting rollback."
+
+              if [ -n "$PREVIOUS_TAG" ]; then
+                export IMAGE_TAG="$PREVIOUS_TAG"
+
+                docker compose -f docker-compose.prod.yml pull
+                docker compose -f docker-compose.prod.yml up -d
+
+                echo "Rollback attempted to image: $PREVIOUS_TAG"
+              else
+                echo "No previous successful image tag is available."
+              fi
+
+              exit 1
+            fi
