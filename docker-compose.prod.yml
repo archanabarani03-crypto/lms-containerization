@@ -1,3 +1,5 @@
+name: lms-cicd
+
 services:
 
   frontend:
