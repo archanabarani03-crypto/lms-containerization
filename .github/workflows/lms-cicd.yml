@@ -6,6 +6,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "Force deployment failure to test automatic rollback"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -76,10 +82,13 @@ jobs:
     steps:
       - name: Deploy Application to EC2
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: SIMULATE_FAILURE
           script: |
             set -uo pipefail
 
@@ -115,7 +124,7 @@ jobs:
                   return 0
                 fi
 
-                echo "Waiting: backend=$BACKEND_STATUS frontend=$FRONTEND_STATUS"
+                echo "Waiting for application health: backend=$BACKEND_STATUS frontend=$FRONTEND_STATUS"
                 sleep 5
               done
 
@@ -132,6 +141,11 @@ jobs:
               if wait_for_health; then
                 DEPLOY_OK=true
               fi
+            fi
+
+            if [ "${SIMULATE_FAILURE:-false}" = "true" ]; then
+              echo "TEST MODE: Simulating deployment failure."
+              DEPLOY_OK=false
             fi
 
             if [ "$DEPLOY_OK" = true ]; then
